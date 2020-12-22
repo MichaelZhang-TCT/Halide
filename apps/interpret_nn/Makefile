@@ -18,11 +18,12 @@ FLATC ?= flatc
 # This is the location that brew installs on my Mac.
 FLATBUFFERS_INCLUDE_PATH ?= /usr/local/Cellar/flatbuffers/1.12.0/include
 
-CXXFLAGS += -Wno-unused-private-field
+# Removing exceptions just because we don't need 'em and it saves space
+CXXFLAGS += -Wno-unused-private-field -fno-exceptions -fvisibility=hidden
 
 MAKEFILE_DIR=$(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 
-.PHONY: all build clean test build_test_ops
+.PHONY: all build clean test build_test_ops delegate
 all: build
 
 # .SECONDARY with no prerequisites causes all targets to be treated as secondary
@@ -172,6 +173,53 @@ $(BIN)/%/tflite_parser.o: tflite/tflite_parser.cpp $(BIN)/schema/tflite_schema_g
 TFLITE_PARSER_DEPS = \
 	$(BIN)/%/tflite_parser.o
 
+# ---------------------- delegate
+
+TFLITE_INCLUDES_FLAGS ?= -I$(HOME)/GitHub/tensorflow -I$(MAKEFILE_DIR)
+
+$(BIN)/%/halide_delegate.o: delegate/halide_delegate.cpp
+	@mkdir -p $(@D)
+	$(CXX-$*) $(CXXFLAGS-$*) $(TFLITE_INCLUDES_FLAGS) $(UTIL_CXXFLAGS) -c $< -o $@
+
+$(BIN)/%/halide_delegate_adaptor.o: delegate/halide_delegate_adaptor.cpp
+	@mkdir -p $(@D)
+	$(CXX-$*) $(CXXFLAGS-$*) $(TFLITE_INCLUDES_FLAGS) $(UTIL_CXXFLAGS) -c $< -o $@
+
+COMMON_LD_FLAGS=$(LDFLAGS) -ldl -lpthread -lz
+
+ifeq ($(UNAME), Darwin)
+INSTALL_NAME_TOOL_LD_FLAGS=-Wl,-headerpad_max_install_names
+else
+INSTALL_NAME_TOOL_LD_FLAGS=
+endif
+
+ifeq ($(UNAME), Darwin)
+EXPORT_SYMBOLS_FLAGS=-Wl,-exported_symbols_list delegate/exported_symbols.osx
+else
+EXPORT_SYMBOLS_FLAGS=???TODO
+endif
+
+ifeq ($(UNAME), Linux)
+DELEGATE_SONAME_FLAGS=-Wl,-soname,libHalideDelegate.so
+else
+DELEGATE_SONAME_FLAGS=
+endif
+
+# Note: delegates are apparently always .so on OSX (never .dylib)
+# TODO: add a linker script to expose only the exported symbols we want
+$(BIN)/%/libHalideDelegate.so: \
+		$(BIN)/%/halide_delegate.o \
+		$(BIN)/%/halide_delegate_adaptor.o \
+		$(INTERPRETER_DEPS) \
+		$(UTIL_DEPS)
+	@mkdir -p $(@D)
+	$(CXX-$*) -shared $^ $(COMMON_LD_FLAGS) $(INSTALL_NAME_TOOL_LD_FLAGS) $(DELEGATE_SONAME_FLAGS) $(EXPORT_SYMBOLS_FLAGS) -o $@
+ifeq ($(UNAME), Darwin)
+	install_name_tool -id $(CURDIR)/$(BIN)/$*/libHalideDelegate.so $(BIN)/$*/libHalideDelegate.so
+endif
+
+delegate: $(BIN)/$(HL_TARGET)/libHalideDelegate.so
+
 # ---------------------- test
 
 # unit tests for each op (not yet complete)
@@ -311,7 +359,7 @@ TFLITE_SHARED_LIBRARY ?= ERROR_TODO
 endif
 
 # To build for Android, use `HL_TARGET=arm-64-android make compare_vs_tflite`
-$(BIN)/%/compare_vs_tflite: compare_vs_tflite.cpp $(INTERPRETER_DEPS) $(TFLITE_PARSER_DEPS) $(UTIL_DEPS) $(TFLITE_SHARED_LIBRARY)
+$(BIN)/%/compare_vs_tflite: compare_vs_tflite.cpp $(INTERPRETER_DEPS) $(TFLITE_PARSER_DEPS) $(UTIL_DEPS) $(TFLITE_SHARED_LIBRARY) $(BIN)/$(HL_TARGET)/libHalideDelegate.so
 	@mkdir -p $(@D)
 	$(CXX-$*) $(CXXFLAGS-$*) $(APP_CXXFLAGS) -I$(TFLITE_INCLUDES) $(TFLITE_LDFLAGS) $(filter %.cpp %.o %.a %.so %.$(SHARED_EXT),$^) -o $@ $(LDFLAGS-$*)
 
