@@ -193,7 +193,11 @@ std::shared_ptr<Tensor> ConvertTfLiteTensor(const TfLiteTensor &tensor) {
         quantization.dimension = tensor.dims->size - q->quantized_dimension;
     }
 
-    return std::make_shared<Tensor>(tensor.name, type, std::move(shape),
+    // tensor.name can be null, apparently. I don't think we have any requirement
+    // for unique or non-empty names in our code, so let's just map that to
+    // an empty string.
+    const char *name = tensor.name ? tensor.name : "";
+    return std::make_shared<Tensor>(name, type, std::move(shape),
                                     std::move(data), std::move(quantization));
 }
 
@@ -208,8 +212,6 @@ public:
     // Init() will be called exactly once per instance.
     TfLiteStatus Init(TfLiteContext *context,
                       const TfLiteDelegateParams *params) {
-        LOG(INFO) << __FILE__ << ":" << __LINE__ << " " << __FUNCTION__ << "\n";
-
         if (model_ != nullptr || interpreter_ != nullptr) {
             TF_LITE_KERNEL_LOG(context, "Init must not be called twice.");
             return kTfLiteError;
@@ -223,28 +225,33 @@ public:
         }
         LOG(INFO) << "Delegate " << (void *)this << " Init nodes: " << node_indices << "\n";
 
-        const auto add_tensor = [&](int tensor_id, bool is_input) {
-            assert(tensor_id >= 0 && tensor_id < (int)context->tensors_size);
+        // Pre-emptively map *all* the TFLiteTensors into our Tensor type.
+        for (size_t tensor_id = 0; tensor_id < context->tensors_size; tensor_id++) {
             const TfLiteTensor &tensor = context->tensors[tensor_id];
             auto t = ConvertTfLiteTensor(tensor);
-            if (is_input) {
-                t->set_input(true);
-            } else {
-                t->set_output(true);
-            }
             model_->tensors.emplace_back(t);
             assert(!tensor_id_to_tensor_ptr_.count(tensor_id));
             tensor_id_to_tensor_ptr_[tensor_id] = t;
             // LOG(INFO) << "tensor_id " << tensor_id << " -> " << (void*) t.get() << "\n";
-        };
+        }
 
-        // Add the input tensors.
+        // Be careful with params->input_tensors and params->output_tensors here;
+        // in particular, params->input_tensors will contain all of the 'constant'
+        // input tensors (which are generally inputs only to a specific node).
+#if ALLOW_DYNAMIC_TENSORS
+        // TODO: verify the above comment is still correct.
+#endif
+
+        // Mark the input and output tensors correctly, as code in our interpreter
+        // relies upon it. TODO: verify that is necessary.
         for (int i = 0; i < params->input_tensors->size; i++) {
             const int tensor_id = params->input_tensors->data[i];
             if (tensor_id == kTfLiteOptionalTensor) {
                 continue;
             }
-            add_tensor(tensor_id, true);
+            auto t = GetTensorById(context, tensor_id);
+            t->set_input(true);
+            // LOG(INFO) << "Delegate " << (void *)this << (t->is_constant() ? " Const" : "") << " Input tensor: " << tensor_id << "\n";
         }
 
         // Add the output tensors.
@@ -253,7 +260,9 @@ public:
             if (tensor_id == kTfLiteOptionalTensor) {
                 continue;
             }
-            add_tensor(tensor_id, false);
+            // LOG(INFO) << "Delegate " << (void *)this << " Output tensor: " << tensor_id << "\n";
+            auto t = GetTensorById(context, tensor_id);
+            t->set_output(true);
         }
 
         // Add all ops.
@@ -282,6 +291,7 @@ public:
             }
             model_->ops.emplace_back(std::move(op));
         }
+
         return kTfLiteOk;
     }
 
@@ -333,10 +343,11 @@ public:
             }
             assert(tensor_id >= 0 && tensor_id < (int)context->tensors_size);
             const TfLiteTensor &tensor = context->tensors[tensor_id];
-            if (tensor.allocation_type == kTfLiteMmapRo) {
+            auto t = GetTensorById(context, tensor_id);
+            assert(t->is_constant() == (tensor.allocation_type == kTfLiteMmapRo));
+            if (t->is_constant()) {
                 continue;
             }
-            auto t = GetTensorById(tensor_id);
             assert(t->is_input() && !t->is_constant() && t->is_allocated());
             auto buf = t->data<void>();
             assert(buf.size_in_bytes() == tensor.bytes);
@@ -357,7 +368,7 @@ public:
             assert(tensor_id >= 0 && tensor_id < (int)context->tensors_size);
             const TfLiteTensor &tensor = context->tensors[tensor_id];
             assert(tensor.allocation_type != kTfLiteMmapRo);
-            auto t = GetTensorById(tensor_id);
+            auto t = GetTensorById(context, tensor_id);
             assert(t->is_output() && !t->is_constant() && t->is_allocated());
             auto buf = t->data<const void>();
             assert(buf.size_in_bytes() == tensor.bytes);
@@ -419,27 +430,27 @@ private:
         return self->Eval(context, node);
     };
 
-    Tensor *GetTensorById(int tensor_id) {
+    Tensor *GetTensorById(TfLiteContext *context, int tensor_id) {
         auto it = tensor_id_to_tensor_ptr_.find(tensor_id);
         if (it == tensor_id_to_tensor_ptr_.end()) {
-            LOG(FATAL) << "tensor_id not found: " << tensor_id;
+            LOG(ERROR) << "tensor_id not found: " << tensor_id;
             return nullptr;
         }
         return it->second.get();
     }
 
     std::unique_ptr<Op> BuildAdd(TfLiteContext *context, TfLiteNode *node) {
-        auto input1 = GetTensorById(node->inputs->data[0]);
-        auto input2 = GetTensorById(node->inputs->data[1]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input1 = GetTensorById(context, node->inputs->data[0]);
+        auto input2 = GetTensorById(context, node->inputs->data[1]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         const TfLiteAddParams *params = (const TfLiteAddParams *)(node->builtin_data);
         auto activation = ConvertTfLiteActivation(params->activation);
         return make_unique<AddOp>(input1, input2, output, activation);
     }
 
     std::unique_ptr<Op> BuildAveragePool2d(TfLiteContext *context, TfLiteNode *node) {
-        auto input = GetTensorById(node->inputs->data[0]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input = GetTensorById(context, node->inputs->data[0]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         const TfLitePoolParams *params = (const TfLitePoolParams *)(node->builtin_data);
         auto padding = ConvertTfLitePadding(params->padding);
         const std::vector<int> stride = {
@@ -457,9 +468,9 @@ private:
     std::unique_ptr<Op> BuildConcatenation(TfLiteContext *context, TfLiteNode *node) {
         std::vector<Tensor *> inputs(node->inputs->size);
         for (int i = 0; i < node->inputs->size; i++) {
-            inputs[i] = GetTensorById(node->inputs->data[i]);
+            inputs[i] = GetTensorById(context, node->inputs->data[i]);
         }
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         const TfLiteConcatenationParams *params = (const TfLiteConcatenationParams *)(node->builtin_data);
         auto activation = ConvertTfLiteActivation(params->activation);
         int axis = params->axis;
@@ -474,10 +485,10 @@ private:
     }
 
     std::unique_ptr<Op> BuildConv2d(TfLiteContext *context, TfLiteNode *node) {
-        auto input = GetTensorById(node->inputs->data[0]);
-        auto filter = GetTensorById(node->inputs->data[1]);
-        auto bias = GetTensorById(node->inputs->data[2]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input = GetTensorById(context, node->inputs->data[0]);
+        auto filter = GetTensorById(context, node->inputs->data[1]);
+        auto bias = GetTensorById(context, node->inputs->data[2]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         const TfLiteConvParams *params = (const TfLiteConvParams *)(node->builtin_data);
         auto padding = ConvertTfLitePadding(params->padding);
         const std::vector<int> stride = {
@@ -494,10 +505,10 @@ private:
     }
 
     std::unique_ptr<Op> BuildDepthwiseConv2d(TfLiteContext *context, TfLiteNode *node) {
-        auto input = GetTensorById(node->inputs->data[0]);
-        auto filter = GetTensorById(node->inputs->data[1]);
-        auto bias = GetTensorById(node->inputs->data[2]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input = GetTensorById(context, node->inputs->data[0]);
+        auto filter = GetTensorById(context, node->inputs->data[1]);
+        auto bias = GetTensorById(context, node->inputs->data[2]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         const TfLiteDepthwiseConvParams *params = (const TfLiteDepthwiseConvParams *)(node->builtin_data);
         auto padding = ConvertTfLitePadding(params->padding);
         const std::vector<int> stride = {
@@ -517,18 +528,18 @@ private:
     }
 
     std::unique_ptr<Op> BuildFullyConnected(TfLiteContext *context, TfLiteNode *node) {
-        auto input = GetTensorById(node->inputs->data[0]);
-        auto filter = GetTensorById(node->inputs->data[1]);
-        auto bias = GetTensorById(node->inputs->data[2]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input = GetTensorById(context, node->inputs->data[0]);
+        auto filter = GetTensorById(context, node->inputs->data[1]);
+        auto bias = GetTensorById(context, node->inputs->data[2]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         const TfLiteFullyConnectedParams *params = (const TfLiteFullyConnectedParams *)(node->builtin_data);
         auto activation = ConvertTfLiteActivation(params->activation);
         return make_unique<FullyConnectedOp>(input, filter, bias, output, activation);
     }
 
     std::unique_ptr<Op> BuildMaxPool2d(TfLiteContext *context, TfLiteNode *node) {
-        auto input = GetTensorById(node->inputs->data[0]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input = GetTensorById(context, node->inputs->data[0]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         const TfLitePoolParams *params = (const TfLitePoolParams *)(node->builtin_data);
         auto padding = ConvertTfLitePadding(params->padding);
         const std::vector<int> stride = {
@@ -544,15 +555,15 @@ private:
     }
 
     std::unique_ptr<Op> BuildPad(TfLiteContext *context, TfLiteNode *node) {
-        auto input = GetTensorById(node->inputs->data[0]);
-        auto padding = GetTensorById(node->inputs->data[1]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input = GetTensorById(context, node->inputs->data[0]);
+        auto padding = GetTensorById(context, node->inputs->data[1]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         return make_unique<PadOp>(input, padding, output);
     }
 
     std::unique_ptr<Op> BuildReshape(TfLiteContext *context, TfLiteNode *node) {
-        auto input = GetTensorById(node->inputs->data[0]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input = GetTensorById(context, node->inputs->data[0]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         const TfLiteReshapeParams *params = (const TfLiteReshapeParams *)(node->builtin_data);
         std::vector<int> new_shape;
         new_shape.assign(params->shape, params->shape + params->num_dimensions);
@@ -560,8 +571,8 @@ private:
     }
 
     std::unique_ptr<Op> BuildQuantize(TfLiteContext *context, TfLiteNode *node) {
-        auto input = GetTensorById(node->inputs->data[0]);
-        auto output = GetTensorById(node->outputs->data[0]);
+        auto input = GetTensorById(context, node->inputs->data[0]);
+        auto output = GetTensorById(context, node->outputs->data[0]);
         return make_unique<QuantizeOp>(input, output);
     }
 
@@ -617,6 +628,153 @@ bool IsActivationReluOrNone(TfLiteFusedActivation activation) {
             activation == kTfLiteActNone);
 }
 
+// TODO: this should also allow Int8 once we fix biasing for those
+constexpr int k8BitMask = 1 << kTfLiteUInt8;
+
+bool IsNodeSupported_Add(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    if (!InputsHaveCorrectTypes(
+            node, context,
+            {k8BitMask, k8BitMask})) {
+        return false;
+    }
+    const TfLiteAddParams *params = (const TfLiteAddParams *)(node->builtin_data);
+    if (!IsActivationReluOrNone(params->activation)) {
+        return false;
+    }
+    return true;
+}
+
+bool IsNodeSupported_AveragePool2d(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    if (!InputsHaveCorrectTypes(
+            node, context,
+            {k8BitMask})) {
+        return false;
+    }
+    const TfLitePoolParams *params = (const TfLitePoolParams *)(node->builtin_data);
+    if (!IsActivationReluOrNone(params->activation)) {
+        return false;
+    }
+    return true;
+}
+
+bool IsNodeSupported_Concatenation(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    if (!AllInputsHaveType(node, context, k8BitMask)) {
+        return false;
+    }
+    // TODO: This op has an activation but we don't appear to use it.
+    // const TfLiteConcatenationParams *params = (const TfLiteConcatenationParams *)(node->builtin_data);
+    return true;
+}
+
+bool IsNodeSupported_Conv2d(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    if (!InputsHaveCorrectTypes(
+            node, context,
+            {k8BitMask, k8BitMask, 1 << kTfLiteInt32})) {
+        return false;
+    }
+    const TfLiteConvParams *params = (const TfLiteConvParams *)(node->builtin_data);
+    if (!IsActivationReluOrNone(params->activation)) {
+        return false;
+    }
+    return true;
+}
+
+bool IsNodeSupported_DepthwiseConv2d(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    if (!InputsHaveCorrectTypes(
+            node, context,
+            {k8BitMask, k8BitMask, 1 << kTfLiteInt32})) {
+        return false;
+    }
+    const TfLiteDepthwiseConvParams *params = (const TfLiteDepthwiseConvParams *)(node->builtin_data);
+    if (!IsActivationReluOrNone(params->activation)) {
+        return false;
+    }
+    return true;
+}
+
+bool IsNodeSupported_FullyConnected(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    // This is correct, we don't handle the params for v2 or later yet
+    if (!(registration->version <= 1)) {
+        return false;
+    }
+    if (!InputsHaveCorrectTypes(
+            node, context,
+            {k8BitMask, k8BitMask, (1 << kTfLiteInt32) | (1 << kTfLiteNoType)})) {
+        return false;
+    }
+    const TfLiteFullyConnectedParams *params = (const TfLiteFullyConnectedParams *)(node->builtin_data);
+    if (!IsActivationReluOrNone(params->activation)) {
+        return false;
+    }
+    return true;
+}
+
+bool IsNodeSupported_MaxPool2d(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    if (!InputsHaveCorrectTypes(
+            node, context,
+            {k8BitMask})) {
+        return false;
+    }
+    const TfLitePoolParams *params = (const TfLitePoolParams *)(node->builtin_data);
+    if (!IsActivationReluOrNone(params->activation)) {
+        return false;
+    }
+    return true;
+}
+
+bool IsNodeSupported_Pad(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    if (!InputsHaveCorrectTypes(
+            node, context,
+            {k8BitMask, 1 << kTfLiteInt32})) {
+        return false;
+    }
+    return true;
+}
+
+bool IsNodeSupported_Reshape(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    // Note that Reshape can have 1 or 2 inputs.
+    if (node->inputs->size > 2) {
+        return false;
+    }
+    return true;
+}
+
+bool IsNodeSupported_Quantize(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
+    if (!(registration->version <= 2)) {
+        return false;
+    }
+    if (!InputsHaveCorrectTypes(
+            node, context,
+            {k8BitMask})) {
+        return false;
+    }
+    return true;
+}
+
 bool IsNodeSupported(TfLiteContext *context, TfLiteNode *node, TfLiteRegistration *registration) {
     // Ensure all inputs & outputs have dim <= 4.
     for (int i = 0; i < node->inputs->size; ++i) {
@@ -637,196 +795,27 @@ bool IsNodeSupported(TfLiteContext *context, TfLiteNode *node, TfLiteRegistratio
         }
     }
 
-    // TODO: this should also allow Int8 once we fix biasing for those
-    constexpr int k8BitMask = 1 << kTfLiteUInt8;
-
     // Now check for each specific node.
     //
     // TODO: Our existing code for TFLiteParser, etc doesn't pay
     // attention to version (AFAICT); need to find & examine the specs of
     // version changes to ensure this is correct. Existing version checking
-    // here is mostly bogus.
+    // here is mostly bogus. See tensorflow/lite/tools/versioning/op_version.cc
     //
     // TODO: style here is imitation of approach used in Hexagon delegate,
-    // but a purely data-table-driven-approach may be better in the long run.
+    // but a purely data-table-driven-approach might be better in the long run?
+
+    // clang-format off
     switch (registration->builtin_code) {
-    case kTfLiteBuiltinAdd: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!InputsHaveCorrectTypes(
-                node, context,
-                {k8BitMask, k8BitMask})) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        const TfLiteAddParams *params = (const TfLiteAddParams *)(node->builtin_data);
-        if (!IsActivationReluOrNone(params->activation)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        return true;
-    }
-    case kTfLiteBuiltinAveragePool2d: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!InputsHaveCorrectTypes(
-                node, context,
-                {k8BitMask})) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        const TfLitePoolParams *params = (const TfLitePoolParams *)(node->builtin_data);
-        if (!IsActivationReluOrNone(params->activation)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        return true;
-    }
-    case kTfLiteBuiltinConcatenation: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!AllInputsHaveType(node, context, k8BitMask)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        // TODO: This op has an activation but we don't appear to use it.
-        // const TfLiteConcatenationParams *params = (const TfLiteConcatenationParams *)(node->builtin_data);
-        return true;
-    }
-    case kTfLiteBuiltinConv2d: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!InputsHaveCorrectTypes(
-                node, context,
-                {k8BitMask, k8BitMask, 1 << kTfLiteInt32})) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        const TfLiteConvParams *params = (const TfLiteConvParams *)(node->builtin_data);
-        if (!IsActivationReluOrNone(params->activation)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        return true;
-    }
-    case kTfLiteBuiltinDepthwiseConv2d: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!InputsHaveCorrectTypes(
-                node, context,
-                {k8BitMask, k8BitMask, 1 << kTfLiteInt32})) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        const TfLiteDepthwiseConvParams *params = (const TfLiteDepthwiseConvParams *)(node->builtin_data);
-        if (!IsActivationReluOrNone(params->activation)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        return true;
-    }
-    case kTfLiteBuiltinFullyConnected: {
-        // This is correct, we don't handle the params for v2 or later yet
-        if (!(registration->version <= 1)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!InputsHaveCorrectTypes(
-                node, context,
-                {k8BitMask, k8BitMask, (1 << kTfLiteInt32) | (1 << kTfLiteNoType)})) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        const TfLiteFullyConnectedParams *params = (const TfLiteFullyConnectedParams *)(node->builtin_data);
-        if (!IsActivationReluOrNone(params->activation)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        return true;
-    }
-    case kTfLiteBuiltinMaxPool2d: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!InputsHaveCorrectTypes(
-                node, context,
-                {k8BitMask})) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        const TfLitePoolParams *params = (const TfLitePoolParams *)(node->builtin_data);
-        if (!IsActivationReluOrNone(params->activation)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        return true;
-    }
-    case kTfLiteBuiltinPad: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!InputsHaveCorrectTypes(
-                node, context,
-                {k8BitMask, 1 << kTfLiteInt32})) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        return true;
-    }
-    case kTfLiteBuiltinReshape: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (node->inputs->size != node->outputs->size) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            LOG(INFO) << "node->inputs->size " << node->inputs->size << "\n";
-            LOG(INFO) << "node->outputs->size " << node->outputs->size << "\n";
-            return false;
-        }
-        // Our ReshapeOp can handle any type.
-        // // TODO: we actually can support reshape for any type.
-        // if (!AllInputsHaveType(node, context, k8BitMask)) {
-        //     LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-        //     LOG(INFO) << "node->inputs->size " << node->inputs->size << "\n";
-        //     for (int i = 0; i < node->inputs->size; i++) {
-        //         const int tensor_id = node->inputs->data[i];
-        //         const TfLiteTensor &tensor = context->tensors[tensor_id];
-        //         LOG(INFO) << "tensor.type " << tensor.type << "\n";
-        //     }
-        //     return false;
-        // }
-        return true;
-    }
-    case kTfLiteBuiltinQuantize: {
-        if (!(registration->version <= 2)) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        if (!InputsHaveCorrectTypes(
-                node, context,
-                {k8BitMask})) {
-            LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
-            return false;
-        }
-        return true;
-    }
+
+        #define KNOWN_OP(OP) case kTfLiteBuiltin##OP: return IsNodeSupported_##OP(context, node, registration);
+        ALL_KNOWN_OPS
+        #undef KNOWN_OP
+
     default:
-        LOG(INFO) << "NODE REJECTED " << __LINE__ << "\n";
         return false;
     }
+    // clang-format on
 
     return false;
 }
